@@ -37,6 +37,22 @@ public interface IFluentValidator<in T> where T : class
     /// <param name="validationResults">When this method returns, contains the validation results.</param>
     /// <returns>True if the instance is valid; otherwise, false.</returns>
     bool Validate(T instance, out ICollection<ValidationResult> validationResults);
+
+    /// <summary>
+    /// Asynchronously validates the specified instance and returns all validation errors.
+    /// </summary>
+    /// <param name="instance">The instance to validate.</param>
+    /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation. The task result contains a collection of <see cref="ValidationResult"/> with any validation errors.</returns>
+    Task<ICollection<ValidationResult>> ValidateAsync(T instance, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Asynchronously determines whether the specified instance is valid.
+    /// </summary>
+    /// <param name="instance">The instance to validate.</param>
+    /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation. The task result contains <c>true</c> if the instance is valid; otherwise, <c>false</c>.</returns>
+    Task<bool> IsValidAsync(T instance, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -60,11 +76,7 @@ public abstract class FluentValidator<T> : IFluentValidator<T> where T : class
         return propertyRule;
     }
 
-    /// <summary>
-    /// Validates the specified instance and returns all validation errors.
-    /// </summary>
-    /// <param name="instance">The instance to validate.</param>
-    /// <returns>A collection of validation results containing any errors.</returns>
+    /// <inheritdoc/>
     public ICollection<ValidationResult> Validate(T instance)
     {
         var errors = new List<ValidationResult>();
@@ -78,26 +90,36 @@ public abstract class FluentValidator<T> : IFluentValidator<T> where T : class
         return errors;
     }
 
-    /// <summary>
-    /// Determines whether the specified instance is valid.
-    /// </summary>
-    /// <param name="instance">The instance to validate.</param>
-    /// <returns>True if the instance is valid; otherwise, false.</returns>
+    /// <inheritdoc/>
     public bool IsValid(T instance)
     {
         return Validate(instance).Count == 0;
     }
 
-    /// <summary>
-    /// Validates the specified instance and outputs all validation errors.
-    /// </summary>
-    /// <param name="instance">The instance to validate.</param>
-    /// <param name="validationResults">When this method returns, contains the validation results.</param>
-    /// <returns>True if the instance is valid; otherwise, false.</returns>
+    /// <inheritdoc/>
     public bool Validate(T instance, out ICollection<ValidationResult> validationResults)
     {
         validationResults = Validate(instance);
         return validationResults.Count == 0;
+    }
+
+    /// <inheritdoc/>
+    public async Task<ICollection<ValidationResult>> ValidateAsync(T instance, CancellationToken cancellationToken = default)
+    {
+        var errors = new List<ValidationResult>();
+        foreach (var validator in _validators)
+        {
+            var results = await validator.ValidateAsync(instance, cancellationToken);
+            errors.AddRange(results);
+        }
+        return errors;
+    }
+
+    /// <inheritdoc/>
+    public async Task<bool> IsValidAsync(T instance, CancellationToken cancellationToken = default)
+    {
+        var results = await ValidateAsync(instance, cancellationToken);
+        return results.Count == 0;
     }
 }
 
@@ -113,6 +135,18 @@ public interface IPropertyValidator<in T> where T : class
     /// <param name="instance">The instance containing the property to validate.</param>
     /// <returns>A collection of validation results containing any errors.</returns>
     ICollection<ValidationResult> Validate(T instance);
+
+    /// <summary>
+    /// Asynchronously validates a property on the specified instance.
+    /// </summary>
+    /// <param name="instance">The instance containing the property to validate.</param>
+    /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation.</param>
+    /// <returns>
+    /// A task that represents the asynchronous validation operation. The task result contains a collection of
+    /// <see cref="ValidationResult"/> with any validation errors related to the property.
+    /// </returns>
+    Task<ICollection<ValidationResult>> ValidateAsync(T instance, CancellationToken cancellationToken = default);
+
 }
 
 /// <summary>
@@ -124,6 +158,7 @@ public class PropertyRule<T, TProperty> : IPropertyValidator<T> where T : class
 {
     private readonly Expression<Func<T, TProperty>> _propertyExpression;
     private readonly List<ValidationRule> _validationRules = new();
+    private readonly List<AsyncValidationRule> _asyncValidationRules = new();
     private readonly string _propertyName;
 
     /// <summary>
@@ -713,6 +748,124 @@ public class PropertyRule<T, TProperty> : IPropertyValidator<T> where T : class
     }
 
     /// <summary>
+    /// Adds an asynchronous validation rule that checks the property value using the specified predicate.
+    /// </summary>
+    /// <param name="predicate">An asynchronous function that determines whether the property value is valid.</param>
+    /// <param name="errorMessage">The error message to return if the validation fails.</param>
+    /// <returns>The current <see cref="PropertyRule{T, TProperty}"/> instance for method chaining.</returns>
+    public PropertyRule<T, TProperty> MustAsync(Func<TProperty, CancellationToken, Task<bool>> predicate, string errorMessage)
+    {
+        _asyncValidationRules.Add(new AsyncValidationRule(
+            async (value, _, token) =>
+            {
+                if (value == null) return new ValidationResult(errorMessage, [_propertyName]);
+                if (!await predicate((TProperty)value, token))
+                {
+                    return new ValidationResult(errorMessage, [_propertyName]);
+                }
+                return ValidationResult.Success;
+            }
+        ));
+        return this;
+    }
+
+    /// <summary>
+    /// Adds an asynchronous validation rule that checks the property value using the specified predicate, which also takes the full instance into account.
+    /// </summary>
+    /// <param name="predicate">An asynchronous function that determines whether the property value is valid, using the instance and property value.</param>
+    /// <param name="errorMessage">The error message to return if the validation fails.</param>
+    /// <returns>The current <see cref="PropertyRule{T, TProperty}"/> instance for method chaining.</returns>
+    public PropertyRule<T, TProperty> MustAsync(Func<T, TProperty, CancellationToken, Task<bool>> predicate, string errorMessage)
+    {
+        _asyncValidationRules.Add(new AsyncValidationRule(
+            async (value, context, token) =>
+            {
+                if (value == null) return new ValidationResult(errorMessage, [_propertyName]);
+                var instance = (T)context.ObjectInstance;
+                if (!await predicate(instance, (TProperty)value, token))
+                {
+                    return new ValidationResult(errorMessage, [_propertyName]);
+                }
+                return ValidationResult.Success;
+            }
+        ));
+        return this;
+    }
+
+    /// <summary>
+    /// Conditionally applies validation rules asynchronously if the provided condition evaluates to true.
+    /// </summary>
+    /// <param name="condition">An asynchronous function that determines whether the rules should be applied based on the instance.</param>
+    /// <param name="action">An action that defines the validation rules to apply when the condition is met.</param>
+    /// <returns>The current <see cref="PropertyRule{T, TProperty}"/> instance for method chaining.</returns>
+    public PropertyRule<T, TProperty> WhenAsync(
+    Func<T, CancellationToken, Task<bool>> condition,
+    Action<PropertyRule<T, TProperty>> action)
+    {
+        var conditionalRule = new PropertyRule<T, TProperty>(_propertyExpression);
+        action(conditionalRule);
+
+        // Add synchronous rules with async condition
+        foreach (var rule in conditionalRule._validationRules)
+        {
+            _asyncValidationRules.Add(new AsyncValidationRule((value, context, _) =>
+                {
+                    // Convert sync validation to async
+                    var validationResults = new List<ValidationResult>();
+                    var validationContext = new ValidationContext(context.ObjectInstance)
+                    {
+                        MemberName = context.MemberName
+                    };
+
+                    if (!System.ComponentModel.DataAnnotations.Validator.TryValidateValue(
+                        value, validationContext, validationResults, [rule.Attribute]))
+                    {
+                        return Task.FromResult(validationResults.FirstOrDefault());
+                    }
+                    return Task.FromResult(ValidationResult.Success);
+                },
+                condition
+            ));
+        }
+
+        // Add async rules with the condition
+        foreach (var asyncRule in conditionalRule._asyncValidationRules)
+        {
+            _asyncValidationRules.Add(new AsyncValidationRule(
+                asyncRule.AsyncValidator,
+                async (instance, token) =>
+                {
+                    // Combine original condition with this new condition
+                    if (asyncRule.AsyncCondition != null)
+                    {
+                        return await condition(instance, token) &&
+                               await asyncRule.AsyncCondition(instance, token);
+                    }
+                    return await condition(instance, token);
+                }
+            ));
+        }
+
+        return this;
+    }
+
+    /// <summary>
+    /// Conditionally applies validation rules asynchronously unless the provided condition evaluates to true.
+    /// </summary>
+    /// <param name="condition">An asynchronous function that determines whether the rules should be skipped based on the instance.</param>
+    /// <param name="action">An action that defines the validation rules to apply when the condition is not met.</param>
+    /// <returns>The current <see cref="PropertyRule{T, TProperty}"/> instance for method chaining.</returns>
+    public PropertyRule<T, TProperty> UnlessAsync(
+        Func<T, CancellationToken, Task<bool>> condition,
+        Action<PropertyRule<T, TProperty>> action)
+    {
+        return WhenAsync(
+            async (instance, token) => !await condition(instance, token),
+            action
+        );
+    }
+
+    /// <summary>
     /// Validates the specified instance according to all the defined rules.
     /// </summary>
     /// <param name="instance">The instance to validate.</param>
@@ -748,6 +901,49 @@ public class PropertyRule<T, TProperty> : IPropertyValidator<T> where T : class
     }
 
     /// <summary>
+    /// Asynchronously validates the property on the specified instance by executing both synchronous and asynchronous validation rules.
+    /// </summary>
+    /// <param name="instance">The instance containing the property to validate.</param>
+    /// <param name="cancellationToken">A cancellation token that can be used to cancel the asynchronous validation operation.</param>
+    /// <returns>
+    /// A task that represents the asynchronous validation operation. The task result contains a collection of
+    /// <see cref="ValidationResult"/> objects with any validation errors found during both synchronous and asynchronous validations.
+    /// </returns>
+    public async Task<ICollection<ValidationResult>> ValidateAsync(T instance, CancellationToken cancellationToken = default)
+    {
+        var errors = new List<ValidationResult>();
+
+        // First run synchronous validations
+        errors.AddRange(Validate(instance));
+
+        // Then run async validations
+        var propertyFunc = _propertyExpression.Compile();
+        var value = propertyFunc(instance);
+
+        foreach (var rule in _asyncValidationRules)
+        {
+            if (rule.AsyncCondition != null)
+            {
+                bool shouldRun = await rule.AsyncCondition(instance, cancellationToken);
+                if (!shouldRun) continue;
+            }
+
+            var validationContext = new ValidationContext(instance)
+            {
+                MemberName = _propertyName
+            };
+
+            var result = await rule.AsyncValidator(value, validationContext, cancellationToken);
+            if (result != null && result != ValidationResult.Success)
+            {
+                errors.Add(result);
+            }
+        }
+
+        return errors;
+    }
+
+    /// <summary>
     /// Inner class to hold validation attribute and condition.
     /// </summary>
     private class ValidationRule
@@ -771,6 +967,35 @@ public class PropertyRule<T, TProperty> : IPropertyValidator<T> where T : class
         {
             Attribute = attribute;
             Condition = condition;
+        }
+    }
+
+    /// <summary>
+    /// Represents an asynchronous validation rule, including the async validator function and an optional condition.
+    /// </summary>
+    private class AsyncValidationRule
+    {
+        /// <summary>
+        /// Gets the asynchronous validator function that performs validation.
+        /// </summary>
+        public Func<object?, ValidationContext, CancellationToken, Task<ValidationResult?>> AsyncValidator { get; }
+
+        /// <summary>
+        /// Gets the optional asynchronous condition that determines whether the validation should be executed.
+        /// </summary>
+        public Func<T, CancellationToken, Task<bool>>? AsyncCondition { get; }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AsyncValidationRule"/> class.
+        /// </summary>
+        /// <param name="validator">The asynchronous validator function that performs the validation.</param>
+        /// <param name="condition">An optional asynchronous condition that determines whether the rule should be applied.</param>
+        public AsyncValidationRule(
+            Func<object?, ValidationContext, CancellationToken, Task<ValidationResult?>> validator,
+            Func<T, CancellationToken, Task<bool>>? condition = null)
+        {
+            AsyncValidator = validator;
+            AsyncCondition = condition;
         }
     }
 }
@@ -866,5 +1091,31 @@ public static class FluentValidatorServiceCollection
             .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IFluentValidator<>));
 
         return interfaceType?.GetGenericArguments().FirstOrDefault();
+    }
+}
+
+/// <summary>
+/// Provides extension methods for working with <see cref="ICollection{ValidationResult}"/> instances.
+/// </summary>
+public static class ValidationResultExtensions
+{
+    /// <summary>
+    /// Determines whether the validation results indicate a valid state (no errors).
+    /// </summary>
+    /// <param name="validationResults">The collection of validation results to check.</param>
+    /// <returns>True if there are no validation errors, false otherwise.</returns>
+    public static bool IsValid(this ICollection<ValidationResult> validationResults)
+    {
+        return validationResults.Count == 0;
+    }
+
+    /// <summary>
+    /// Determines whether the validation results indicate an invalid state (has errors).
+    /// </summary>
+    /// <param name="validationResults">The collection of validation results to check.</param>
+    /// <returns>True if there are validation errors, false otherwise.</returns>
+    public static bool HasErrors(this ICollection<ValidationResult> validationResults)
+    {
+        return validationResults.Count > 0;
     }
 }
